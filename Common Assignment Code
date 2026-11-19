@@ -1,0 +1,289 @@
+
+SERVER Code:
+"""Multi-client server where TCP and UDP listen on the same port number."""
+
+import argparse
+import random
+import socket
+import socketserver
+import threading
+import time
+
+LOG = []
+LOG_LOCK = threading.Lock()
+
+
+def log_event(**fields):
+    """Record a timestamped server event in a thread-safe log."""
+    fields["time"] = time.time()
+    with LOG_LOCK:
+        LOG.append(fields)
+    print(f"[{fields['proto']}] {fields}")
+
+
+class TCPHandler(socketserver.StreamRequestHandler):
+    """Handle incoming TCP client connections and acknowledge each line."""
+
+    def handle(self):
+        peer = self.client_address
+        log_event(proto="TCP", event="connected", peer=peer)
+        try:
+            for raw in self.rfile:
+                line = raw.decode().rstrip("\n")
+                if not line:
+                    continue
+                client_id, seq, payload = line.split("|", 2)
+                log_event(
+                    proto="TCP",
+                    event="received",
+                    client=client_id,
+                    seq=int(seq),
+                    size=len(payload),
+                    peer=peer,
+                )
+                self.wfile.write(f"ACK|{client_id}|{seq}\n".encode())
+                self.wfile.flush()
+        finally:
+            log_event(proto="TCP", event="closed", peer=peer)
+
+
+class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+class UDPServer(threading.Thread):
+    """Receives datagrams and acknowledges each one.
+
+    drop_rate injects loss at the application layer so the sender experiences
+    a lost message as it would on a congested network.
+    """
+
+    def __init__(self, host: str, port: int, drop_rate: float = 0.0):
+        super().__init__(daemon=True)
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind((host, port))
+        self.sock.settimeout(0.1)
+        self.drop_rate = drop_rate
+        self.running = True
+
+    def run(self):
+        while self.running:
+            try:
+                data, peer = self.sock.recvfrom(65535)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+            client_id, seq, payload = data.decode().split("|", 2)
+            if random.random() < self.drop_rate:
+                log_event(
+                    proto="UDP",
+                    event="dropped",
+                    client=client_id,
+                    seq=int(seq),
+                    peer=peer,
+                )
+                continue
+
+            log_event(
+                proto="UDP",
+                event="received",
+                client=client_id,
+                seq=int(seq),
+                size=len(payload),
+                peer=peer,
+            )
+            self.sock.sendto(f"ACK|{client_id}|{seq}".encode(), peer)
+
+    def stop(self):
+        self.running = False
+        self.join(timeout=1)
+        self.sock.close()
+
+
+def start_server(host: str = "127.0.0.1", port: int = 9100, udp_drop_rate: float = 0.0):
+    tcp = ThreadedTCPServer((host, port), TCPHandler)
+    threading.Thread(target=tcp.serve_forever, daemon=True).start()
+    udp = UDPServer(host, port, drop_rate=udp_drop_rate)
+    udp.start()
+    return tcp, udp
+
+
+def stop_server(servers):
+    tcp, udp = servers
+    tcp.shutdown()
+    tcp.server_close()
+    udp.stop()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Start dual TCP/UDP server")
+    parser.add_argument("--host", default="127.0.0.1", help="Host interface to bind")
+    parser.add_argument("--port", type=int, default=9100, help="Port number for TCP and UDP")
+    parser.add_argument(
+        "--drop-rate",
+        type=float,
+        default=0.0,
+        help="Simulated UDP packet drop rate (0.0 to 1.0)",
+    )
+    args = parser.parse_args()
+
+    servers = start_server(args.host, args.port, args.drop_rate)
+    print(f"Server listening on {args.host}:{args.port} (TCP & UDP). Press Ctrl+C to stop.")
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nShutting down server...")
+        stop_server(servers)
+
+
+if __name__ == "__main__":
+    main()
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------
+Client:
+"""Client for the dual TCP and UDP server. Sends messages and measures RTT."""
+
+import argparse
+import socket
+import time
+
+
+def tcp_session(host: str, port: int, client_id: str, messages: list[str]) -> dict:
+    t0 = time.perf_counter()
+    sock = socket.create_connection((host, port))
+    connect_time = time.perf_counter() - t0
+    stream = sock.makefile("rwb")
+
+    results = []
+    for seq, payload in enumerate(messages, 1):
+        t = time.perf_counter()
+        sock.sendall(f"{client_id}|{seq}|{payload}\n".encode())
+        reply = stream.readline().decode().strip()
+        rtt = time.perf_counter() - t
+        results.append(
+            {
+                "seq": seq,
+                "rtt": rtt,
+                "acked": reply == f"ACK|{client_id}|{seq}",
+            }
+        )
+
+    sock.close()
+    return {"connect": connect_time, "results": results}
+
+
+def udp_session(
+    host: str,
+    port: int,
+    client_id: str,
+    messages: list[str],
+    timeout: float = 0.05,
+    retries: int = 0,
+) -> dict:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
+
+    results = []
+    for seq, payload in enumerate(messages, 1):
+        datagram = f"{client_id}|{seq}|{payload}".encode()
+        expected = f"ACK|{client_id}|{seq}"
+        acked, attempts = False, 0
+        t = time.perf_counter()
+
+        for _ in range(retries + 1):
+            attempts += 1
+            sock.sendto(datagram, (host, port))
+            try:
+                while True:
+                    reply, _ = sock.recvfrom(2048)
+                    if reply.decode() == expected:
+                        acked = True
+                        break
+            except socket.timeout:
+                pass
+            if acked:
+                break
+
+        rtt = time.perf_counter() - t
+        results.append(
+            {
+                "seq": seq,
+                "rtt": rtt,
+                "acked": acked,
+                "attempts": attempts,
+            }
+        )
+
+    sock.close()
+    return {"connect": 0.0, "results": results}
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Send messages over TCP or UDP")
+    parser.add_argument("--host", default="127.0.0.1", help="Server host")
+    parser.add_argument("--port", type=int, default=9100, help="Server port")
+    parser.add_argument("--proto", choices=["tcp", "udp"], default="tcp", help="Protocol")
+    parser.add_argument("--id", default="C1", help="Client identifier")
+    parser.add_argument(
+        "--message",
+        action="append",
+        required=True,
+        help="Message payload (can be specified multiple times)",
+    )
+    parser.add_argument("--timeout", type=float, default=0.05, help="UDP timeout in seconds")
+    parser.add_argument("--retries", type=int, default=0, help="UDP retry count")
+    args = parser.parse_args()
+
+    if args.proto == "tcp":
+        out = tcp_session(args.host, args.port, args.id, args.message)
+    else:
+        out = udp_session(
+            args.host, args.port, args.id, args.message, args.timeout, args.retries
+        )
+
+    print(f"connection setup {out['connect'] * 1000:.3f} ms")
+    for r in out["results"]:
+        status = "ACK received" if r["acked"] else "no acknowledgment"
+        print(f"message {r['seq']}: {status}, time {r['rtt'] * 1000:.3f} ms")
+
+
+if __name__ == "__main__":
+    main()
+------------------------------------------------------------------------------------------------------------------------------------------------------------------
+Readme:
+# Dual TCP/UDP Multi-Client Server & Benchmark Client
+
+A lightweight Python networking project demonstrating concurrent TCP and UDP servers bound to the same port, paired with a CLI client that measures connection setup time and per-message Round-Trip Time (RTT).
+
+## Features
+
+- **Dual-Protocol Binding:** Runs a multi-threaded TCP server and a UDP datagram listener simultaneously on the same port (`9100` by default).
+- **Packet Loss Simulation:** Configurable application-layer UDP drop rate (`--drop-rate`) to test timeout and retry behavior under simulated congestion.
+- **Latency Benchmarking:** Measures TCP handshake overhead separately from message RTT.
+- **Zero External Dependencies:** Built purely with the Python 3 standard library (`socket`, `socketserver`, `threading`, `argparse`).
+
+## Requirements
+
+- Python 3.9+
+
+## Usage
+
+### 1. Start the Server
+
+Run the server on default `127.0.0.1:9100`:
+
+```bash
+python server.py
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------
+Bash:
+git init
+git add .
+git commit -m "Initial commit: dual TCP/UDP server and benchmark client"
+git branch -M main
+git remote add origin https://github.com/<your-username>/tcp-udp-dual-server.git
+git push -u origin main
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------
